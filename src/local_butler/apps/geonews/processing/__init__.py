@@ -1,0 +1,1 @@
+"""Geonews processing subpackage."""

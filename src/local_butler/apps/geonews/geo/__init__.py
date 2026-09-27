@@ -1,0 +1,1 @@
+"""Geonews geo subpackage."""

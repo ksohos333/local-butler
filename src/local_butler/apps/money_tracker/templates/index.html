@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Money Tracker</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #22c55e;
+      --danger: #ef4444;
+      --border: #334155;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .container { max-width: 900px; margin: 0 auto; padding: 2rem; }
+    h1 { margin-top: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 0.5rem;
+      padding: 1rem;
+    }
+    .card .label { color: var(--muted); font-size: 0.875rem; }
+    .card .value { font-size: 1.5rem; font-weight: 600; }
+    .income { color: var(--accent); }
+    .expense { color: var(--danger); }
+    form { background: var(--panel); border: 1px solid var(--border); border-radius: 0.5rem; padding: 1rem; margin-bottom: 1.5rem; }
+    .form-row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: end; }
+    label { display: block; color: var(--muted); font-size: 0.875rem; margin-bottom: 0.25rem; }
+    input, select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 0.375rem; padding: 0.5rem; }
+    button { background: var(--accent); color: #052e16; border: none; border-radius: 0.375rem; padding: 0.5rem 1rem; font-weight: 600; cursor: pointer; }
+    button.danger { background: var(--danger); color: #fff; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.75rem; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    .empty { color: var(--muted); padding: 2rem 0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Money Tracker</h1>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">Income</div>
+        <div class="value income">${{ summary.total_income }}</div>
+      </div>
+      <div class="card">
+        <div class="label">Expenses</div>
+        <div class="value expense">${{ summary.total_expense }}</div>
+      </div>
+      <div class="card">
+        <div class="label">Net</div>
+        <div class="value {% if summary.net >= 0 %}income{% else %}expense{% endif %}">${{ summary.net }}</div>
+      </div>
+    </div>
+
+    <form method="post" action="/transactions">
+      <h3>Add transaction</h3>
+      <div class="form-row">
+        <div>
+          <label for="date">Date</label>
+          <input type="date" id="date" name="date" value="{{ today }}" required>
+        </div>
+        <div>
+          <label for="amount">Amount</label>
+          <input type="number" id="amount" name="amount" step="0.01" min="0.01" placeholder="0.00" required>
+        </div>
+        <div>
+          <label for="kind">Type</label>
+          <select id="kind" name="kind" required>
+            <option value="expense">Expense</option>
+            <option value="income">Income</option>
+          </select>
+        </div>
+        <div>
+          <label for="category">Category</label>
+          <input type="text" id="category" name="category" placeholder="e.g. groceries" required>
+        </div>
+        <div>
+          <label for="description">Description</label>
+          <input type="text" id="description" name="description" placeholder="optional">
+        </div>
+        <button type="submit">Add</button>
+      </div>
+    </form>
+
+    {% if transactions %}
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Category</th>
+          <th>Description</th>
+          <th style="text-align:right">Amount</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in transactions %}
+        <tr>
+          <td>{{ t.date }}</td>
+          <td>{{ t.category.name }} <span style="color:var(--muted)">({{ t.category.kind }})</span></td>
+          <td>{{ t.description or "—" }}</td>
+          <td style="text-align:right" class="{% if t.category.kind == 'income' %}income{% else %}expense{% endif %}">${{ t.amount }}</td>
+          <td style="text-align:right">
+            <form method="post" action="/transactions/{{ t.id }}/delete" style="display:inline">
+              <button class="danger" type="submit" onclick="return confirm('Delete this transaction?')">×</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">No transactions yet.</div>
+    {% endif %}
+  </div>
+</body>
+</html>

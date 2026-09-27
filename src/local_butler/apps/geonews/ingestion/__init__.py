@@ -1,0 +1,1 @@
+"""Geonews ingestion subpackage."""

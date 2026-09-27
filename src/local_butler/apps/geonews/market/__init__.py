@@ -1,0 +1,1 @@
+"""Geonews prediction market subpackage."""

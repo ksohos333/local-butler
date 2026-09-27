@@ -1,0 +1,330 @@
+# Geonews primary source configuration.
+# These are official channels where governments, central banks, militaries,
+# and international organizations publish announcements FIRST.
+
+# ============================================================
+# TIER 1 — RSS feeds (preferred: structured, low-friction)
+# ============================================================
+
+[sources.federal_reserve]
+type = "rss"
+url = "https://www.federalreserve.gov/feeds/press_all.xml"
+category = "central_bank"
+region = "United States"
+language = "en"
+priority = 1
+
+[sources.ecb]
+type = "rss"
+url = "https://www.ecb.europa.eu/rss/press.html"
+category = "central_bank"
+region = "European Union"
+language = "en"
+priority = 1
+
+[sources.bank_of_england]
+type = "rss"
+url = "https://www.bankofengland.co.uk/rss/news"
+category = "central_bank"
+region = "United Kingdom"
+language = "en"
+priority = 1
+
+[sources.bank_of_japan]
+type = "rss"
+url = "https://www.boj.or.jp/en/rss/whatsnew.xml"
+category = "central_bank"
+region = "Japan"
+language = "en"
+priority = 1
+
+[sources.rbi]
+type = "rss"
+url = "https://www.rbi.org.in/Scripts/rss.aspx"
+category = "central_bank"
+region = "India"
+language = "en"
+priority = 1
+# /Scripts/rss.aspx now serves an HTML page, not a feed, so feedparser finds
+# no entries. Disabled until a working feed URL is known.
+enabled = false
+
+[sources.un_news]
+type = "rss"
+url = "https://news.un.org/feed/subscribe/en/news/all/rss.xml"
+category = "international_org"
+region = "Global"
+language = "en"
+priority = 1
+
+[sources.eu_commission]
+type = "rss"
+url = "https://ec.europa.eu/commission/presscorner/api/rss"
+category = "government"
+region = "European Union"
+language = "en"
+priority = 1
+
+
+# ============================================================
+# TIER 2 — Telegram official channels
+# ============================================================
+
+[sources.russia_mod_en]
+type = "telegram"
+channel = "@mod_russia_en"
+category = "military"
+region = "Russia"
+language = "en"
+priority = 1
+
+[sources.russia_mfa]
+type = "telegram"
+channel = "@MFARussia"
+category = "government"
+region = "Russia"
+language = "en"
+priority = 1
+
+[sources.kremlin_tg]
+type = "telegram"
+channel = "@news_kremlin_eng"
+category = "government"
+region = "Russia"
+language = "en"
+priority = 1
+
+[sources.irna]
+type = "telegram"
+channel = "@Irna_en"
+category = "state_media"
+region = "Iran"
+language = "en"
+priority = 1
+
+[sources.presstv]
+type = "telegram"
+channel = "@presstv"
+category = "state_media"
+region = "Iran"
+language = "en"
+priority = 1
+
+[sources.idf]
+type = "telegram"
+channel = "@idfofficial"
+category = "military"
+region = "Israel"
+language = "en"
+priority = 1
+
+[sources.israel_mfa]
+type = "telegram"
+channel = "@israelmfa"
+category = "government"
+region = "Israel"
+language = "en"
+priority = 1
+
+[sources.israel_official]
+type = "telegram"
+channel = "@StateofIsraelOfficial"
+category = "government"
+region = "Israel"
+language = "en"
+priority = 1
+
+[sources.xinhua]
+type = "telegram"
+channel = "@XinhuaNewsAgency"
+category = "state_media"
+region = "China"
+language = "en"
+priority = 1
+
+[sources.cgtn]
+type = "telegram"
+channel = "@CGTN_Official"
+category = "state_media"
+region = "China"
+language = "en"
+priority = 1
+
+# ============================================================
+# TIER 3 — Simple HTML scraping (httpx + BeautifulSoup)
+# ============================================================
+
+[sources.pboc]
+type = "scrape_simple"
+url = "https://www.pbc.gov.cn/en/3688110/3688172/index.html"
+category = "central_bank"
+region = "China"
+language = "en"
+priority = 1
+enabled = false
+link_selector = "a"
+
+[sources.kremlin_web]
+type = "rss"
+url = "http://en.kremlin.ru/events/president/news/feed"
+category = "government"
+region = "Russia"
+language = "en"
+priority = 2
+
+[sources.wto]
+type = "scrape_simple"
+url = "https://www.wto.org/english/news_e/news_e.htm"
+category = "international_org"
+region = "Global"
+language = "en"
+priority = 2
+# The news list is rendered client-side and no longer has a server-side feed,
+# so the simple scraper matches nothing. Left disabled until a scraper that
+# can execute JS (or a real feed) is wired up.
+enabled = false
+link_selector = "#content a[href*='/news_e/']"
+
+[sources.iaea]
+type = "scrape_simple"
+url = "https://www.iaea.org/news"
+category = "international_org"
+region = "Global"
+language = "en"
+priority = 2
+enabled = false
+link_selector = "h4.field-content a"
+
+# ============================================================
+# TIER 4 — Playwright scraping (JS-heavy government sites)
+# These are disabled by default and enabled in Phase 4/5.
+# ============================================================
+
+[sources.whitehouse]
+type = "scrape_playwright"
+url = "https://www.whitehouse.gov/briefing-room/"
+category = "government"
+region = "United States"
+language = "en"
+priority = 2
+enabled = false
+link_selector = "article a"
+
+[sources.state_dept]
+type = "scrape_playwright"
+url = "https://www.state.gov/press-releases/"
+category = "government"
+region = "United States"
+language = "en"
+priority = 2
+enabled = false
+link_selector = "article a"
+
+[sources.who]
+type = "scrape_playwright"
+url = "https://www.who.int/news-room/releases"
+category = "international_org"
+region = "Global"
+language = "en"
+priority = 2
+enabled = false
+link_selector = "article a"
+
+[sources.nato]
+type = "scrape_playwright"
+url = "https://www.nato.int/cps/en/natohq/news.htm"
+category = "international_org"
+region = "Global"
+language = "en"
+priority = 2
+enabled = false
+link_selector = "h3 a"
+
+# ============================================================
+# TIER 5 — Regional / West Asia / Middle East / US sources
+# ============================================================
+
+[sources.aljazeera]
+type = "rss"
+url = "https://www.aljazeera.com/xml/rss/all.xml"
+category = "state_media"
+region = "Middle East"
+language = "en"
+priority = 1
+
+[sources.trtworld]
+type = "rss"
+url = "https://feeds.feedburner.com/trtworld"
+category = "state_media"
+region = "Turkey"
+language = "en"
+priority = 1
+
+[sources.arabnews]
+type = "rss"
+url = "https://www.arabnews.com/rss.xml"
+category = "media"
+region = "Saudi Arabia"
+language = "en"
+priority = 1
+
+[sources.anadolu]
+type = "rss"
+url = "https://www.aa.com.tr/en/rss/default?cat=guncel"
+category = "state_media"
+region = "Turkey"
+language = "en"
+priority = 1
+
+[sources.mehrnews]
+type = "rss"
+url = "https://en.mehrnews.com/rss"
+category = "state_media"
+region = "Iran"
+language = "en"
+priority = 1
+
+[sources.sputnik]
+type = "rss"
+url = "https://sputnikglobe.com/export/rss2/archive/index.xml"
+category = "state_media"
+region = "Russia"
+language = "en"
+priority = 1
+
+[sources.npr]
+type = "rss"
+url = "https://feeds.npr.org/1001/rss.xml"
+category = "media"
+region = "United States"
+language = "en"
+priority = 1
+
+[sources.pbs]
+type = "rss"
+url = "https://feeds.feedburner.com/PBSNewsHour"
+category = "media"
+region = "United States"
+language = "en"
+priority = 1
+
+[sources.defense_gov]
+type = "rss"
+url = "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=1&Site=945&max=20"
+category = "military"
+region = "United States"
+language = "en"
+priority = 1
+
+# Truth Social / Donald Trump has no official RSS feed.
+# Use an RSS-Bridge Twitter bridge pointed at @realDonaldTrump if RSS-Bridge is
+# deployed locally, or enable an OpenClaw/Playwright scraper for direct grabs.
+[sources.truth_social]
+type = "rss"
+url = "http://127.0.0.1:4000/?action=display&bridge=Twitter&u=realDonaldTrump&format=Atom"
+category = "social_media"
+region = "United States"
+language = "en"
+priority = 3
+enabled = false
+

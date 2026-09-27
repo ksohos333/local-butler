@@ -1,0 +1,1 @@
+"""Local Butler Diagnostic app."""
