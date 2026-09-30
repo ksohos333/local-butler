@@ -6,12 +6,18 @@
 
 ## A. Calendar / Event Manager
 
+> **Status: shipped.** The scheduling described below is now implemented. See
+> [CALENDAR_SCHEDULING.md](CALENDAR_SCHEDULING.md) for how it actually works.
+> The survey below is kept as the original reasoning, with the machine state
+> corrected where it is now out of date.
+
 ### Current state on the machine
-- **GNOME Calendar** is *not* installed.
-- **Evolution** is *not* installed.
-- The system only ships `evolution-calendar.desktop` in `/usr/share/applications` but the actual package was not installed.
+- **GNOME Calendar** is now *installed* at `/usr/bin/gnome-calendar`.
+- **Evolution** and **Thunderbird** are still *not* installed.
+- **Radicale** (a small CalDAV/CardDAV server) is installed at `/usr/bin/radicale`,
+  runs as a systemd user service on `127.0.0.1:5232`, and is enabled at boot.
+- The `local/calendar` collection exists and holds the `.ics` files.
 - Other CLI calendars (`khal`, `todoman`, `calcurse`, `remind`) are not present.
-- **Radicale** (a small CalDAV/CardDAV server) **is installed** at `/usr/bin/radicale`.
 - **Syncthing** binary exists at `/home/bpoppa12/bin/syncthing` with a web UI desktop shortcut.
 
 ### Recommended architecture: Local CalDAV + any client
@@ -26,7 +32,7 @@
 #### Client options to evaluate
 | Client | Type | Pros | Cons |
 |--------|------|------|------|
-| **GNOME Calendar** | GUI | Native GNOME, notifications, pretty views | Currently not installed; needs Evolution Data Server for CalDAV sync |
+| **GNOME Calendar** | GUI | Native GNOME, notifications, pretty views | Installed; needs Evolution Data Server for CalDAV sync |
 | **Evolution** | GUI E-mail/calendar | Full PIM, CalDAV support, tasks, reminders | Heavy; not installed |
 | **Thunderbird + Lightning** | E-mail/calendar | Already on many systems, CalDAV capable | May not be installed |
 | **calcurse** | TUI | Very lightweight, local `.conf` storage | No CalDAV without scripts |

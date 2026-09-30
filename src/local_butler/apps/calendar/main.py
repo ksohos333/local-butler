@@ -15,6 +15,8 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk
 
+from local_butler.apps.calendar.panel import SchedulePanel
+
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "radicale"
 DATA_DIR = HOME / ".local" / "share" / "radicale" / "collections"
@@ -189,7 +191,7 @@ Then add this CalDAV account:
 
 class CalendarApp(Gtk.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="Local Butler Calendar", default_width=500, default_height=400)
+        super().__init__(application=app, title="Local Butler Calendar", default_width=520, default_height=640)
         self.set_icon_name("x-office-calendar")
 
         header = Gtk.HeaderBar(title="Local Butler Calendar", show_close_button=True)
@@ -228,6 +230,12 @@ class CalendarApp(Gtk.ApplicationWindow):
         box.pack_start(Gtk.Separator(), False, False, 0)
         box.pack_start(scrolled, True, True, 0)
         self.add(box)
+
+        # Natural-language scheduling, below the service controls.
+        self.schedule = SchedulePanel()
+        self.schedule.refresh()
+        GLib.timeout_add_seconds(15, self.schedule.refresh)
+        self.get_child().pack_start(self.schedule, False, False, 0)
 
         self.refresh()
         GLib.timeout_add_seconds(3, self.refresh)
