@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-import json
-import os
+import datetime as dt
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.request
 from pathlib import Path
 
@@ -15,7 +15,18 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk
 
-from local_butler.apps.calendar.panel import SchedulePanel
+from local_butler.apps.calendar.clock import shared_clock
+from local_butler.apps.calendar.events import EventError, describe
+from local_butler.apps.calendar.panels import (
+    AddEventDialog,
+    AgendaPanel,
+    ChatPanel,
+    ClockBar,
+    DayTimeline,
+    EventDialog,
+    MonthView,
+)
+from local_butler.apps.calendar.schedule import ScheduleService
 
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "radicale"
@@ -190,117 +201,296 @@ Then add this CalDAV account:
 
 
 class CalendarApp(Gtk.ApplicationWindow):
+    """Calendar on the left, assistant on the right.
+
+    The month grid and the assistant are separate panes: the assistant spends
+    seconds per turn on the local model, and it must not be able to freeze the
+    grid while it thinks.
+    """
+
     def __init__(self, app):
-        super().__init__(application=app, title="Local Butler Calendar", default_width=520, default_height=640)
+        super().__init__(
+            application=app,
+            title="Local Butler Calendar",
+            default_width=1180,
+            default_height=720,
+        )
+        try:
+            settings = Gtk.Settings.get_default()
+            settings.set_property("gtk-application-prefer-dark-theme", True)
+        except Exception:
+            pass
         self.set_icon_name("x-office-calendar")
 
         header = Gtk.HeaderBar(title="Local Butler Calendar", show_close_button=True)
         self.set_titlebar(header)
+        # One clock for the whole window: NTP-corrected, so the second tick and
+        # the timeline marker agree with each other and with reality.
+        self.atomic_clock = shared_clock()
+        self.clock = ClockBar(self.atomic_clock)
+        header.pack_start(self.clock)
 
-        self.status_label = Gtk.Label(label="Checking...")
+        self.service = ScheduleService()
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=12)
+        self.month = MonthView(on_day_clicked=self._on_day_selected)
+        left.pack_start(self.month, True, True, 0)
+
+        self.timeline = DayTimeline(
+            on_event_clicked=self._on_block_clicked,
+            on_time_clicked=self._on_add_at,
+        )
+        left.pack_start(self.timeline, False, False, 0)
+
+        self.agenda = AgendaPanel(
+            on_delete=self._delete,
+            on_event_clicked=self._on_event_clicked,
+            on_adjust=self._on_adjust,
+            on_add=self._on_add,
+        )
+        left.pack_start(self.agenda, False, False, 0)
+
+        self.status_label = Gtk.Label()
         self.status_label.set_xalign(0)
+        left.pack_start(self.status_label, False, False, 0)
 
-        self.info_label = Gtk.Label(label="")
-        self.info_label.set_xalign(0)
-        self.info_label.set_line_wrap(True)
-
-        self.start_btn = Gtk.Button(label="Start Radicale")
-        self.start_btn.connect("clicked", self._on_start)
-        self.stop_btn = Gtk.Button(label="Stop Radicale")
-        self.stop_btn.connect("clicked", self._on_stop)
-        self.open_client_btn = Gtk.Button(label="Open Calendar Client")
+        self.open_client_btn = Gtk.Button(label="Open GNOME Calendar")
         self.open_client_btn.connect("clicked", self._on_open_client)
+        self.open_client_btn.set_tooltip_text(
+            "GNOME Calendar reads this same Radicale calendar. Note that "
+            "gnome-online-accounts is not installed on this machine, which is "
+            "what GNOME Calendar uses to add a CalDAV account."
+        )
+        left.pack_start(self.open_client_btn, False, False, 0)
 
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        btn_box.pack_start(self.start_btn, False, False, 0)
-        btn_box.pack_start(self.stop_btn, False, False, 0)
-        btn_box.pack_start(self.open_client_btn, False, False, 0)
+        self.chat = ChatPanel(self.service, on_changed=self.refresh)
 
-        self.log_view = Gtk.TextView(editable=False, monospace=True)
-        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD)
-        self.log_buffer = self.log_view.get_buffer()
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_vexpand(True)
-        scrolled.add(self.log_view)
-
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=12)
-        box.pack_start(self.status_label, False, False, 0)
-        box.pack_start(self.info_label, False, False, 0)
-        box.pack_start(btn_box, False, False, 0)
-        box.pack_start(Gtk.Separator(), False, False, 0)
-        box.pack_start(scrolled, True, True, 0)
-        self.add(box)
-
-        # Natural-language scheduling, below the service controls.
-        self.schedule = SchedulePanel()
-        self.schedule.refresh()
-        GLib.timeout_add_seconds(15, self.schedule.refresh)
-        self.get_child().pack_start(self.schedule, False, False, 0)
+        pane = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        pane.set_position(760)
+        pane.pack1(left, True, False)
+        pane.pack2(self.chat, False, False)
+        self.add(pane)
+        self.pane = pane
 
         self.refresh()
-        GLib.timeout_add_seconds(3, self.refresh)
+        GLib.timeout_add_seconds(1, self._tick)
+        GLib.timeout_add_seconds(30, self.refresh)
 
-    def log(self, text):
-        GLib.idle_add(self._append_log, text)
-
-    def _append_log(self, text):
-        end = self.log_buffer.get_end_iter()
-        self.log_buffer.insert(end, text + "\n")
-        self.log_view.scroll_to_iter(self.log_buffer.get_end_iter(), 0.0, False, 0.0, 0.0)
-        return False
-
-    def refresh(self):
-        state = active_state()
-        self.status_label.set_markup(f"<b>Radicale:</b> {state}")
-        self.start_btn.set_sensitive(state != "active")
-        self.stop_btn.set_sensitive(state == "active")
-
-        info = get_calendar_info()
-        lines = []
-        if info.get("running"):
-            lines.append(f"<b>CalDAV URL:</b> {URL}/{DEFAULT_USER}/{DEFAULT_CALENDAR}/")
-            lines.append("<b>User:</b> local  |  <b>Password:</b> local")
-            if info.get("collections"):
-                lines.append("<b>Calendars:</b> " + ", ".join(c["name"] for c in info["collections"]))
-            if info.get("error"):
-                lines.append(f"<b>Error:</b> {info['error']}")
-        else:
-            lines.append("Service is stopped.")
-        client = find_calendar_client()
-        if client:
-            lines.append(f"<b>Client found:</b> {client}")
-        else:
-            lines.append("<b>No calendar client found.</b>")
-        self.info_label.set_markup("\n".join(lines))
-        self.open_client_btn.set_sensitive(state == "active" and client is not None)
+    def _tick(self) -> bool:
+        """One second: move the clock, then the timeline marker with it."""
+        self.clock.tick()
+        self.timeline.tick(self.atomic_clock.now())
         return True
 
-    def _on_start(self, _btn):
-        self.log("Starting Radicale...")
-        ok, err = start_service()
-        if not ok:
-            self.log(f"Failed to start: {err}")
-            return
-        self.log("Radicale started.")
-        ok, url = create_default_calendar()
-        if ok:
-            self.log(f"Default calendar ready: {url}")
-        else:
-            self.log(f"Could not create default calendar: {url}")
+    def _on_day_selected(self, day):
         self.refresh()
 
-    def _on_stop(self, _btn):
-        self.log("Stopping Radicale...")
-        ok, err = stop_service()
-        self.log("Stopped." if ok else f"Failed: {err}")
+    def refresh(self):
+        """Reload the service state, the month grid, and the selected day."""
+        state = active_state()
+        running = state == "active"
+        if not running:
+            start_service()
+            create_default_calendar()
+            running = active_state() == "active"
+        self.status_label.set_markup(
+            "<span foreground='{0}'><b>Calendar:</b> {1}</span>".format(
+                "#2ec27e" if running else "#c01c28", state
+            )
+        )
+        client = find_calendar_client()
+        self.open_client_btn.set_sensitive(running and client is not None)
+
+        if not running:
+            self.month.set_events([])
+            self.agenda.set_events([])
+            self.timeline.set_day(self.month.selected, [])
+            self.chat.set_state([], reachable=False)
+            return True
+
+        try:
+            events = self.service.events()
+        except Exception:  # noqa: BLE001 - an empty grid beats a crash
+            events = []
+        self.month.set_events(events)
+        self.agenda.set_events(events)
+        self.agenda.set_anchor(self.month.selected)
+        self.timeline.set_day(self.month.selected, events)
+        self.chat.set_state(events, reachable=True)
+        return True
+
+    # -- opening events ---------------------------------------------------
+    def _on_event_clicked(self, event, day):
+        """A row in the agenda: open the dialog for that occurrence."""
+        self._open_event(event, day)
+
+    def _on_block_clicked(self, block):
+        """A bar in the timeline: same dialog, same day."""
+        self._open_event(block.event, block.day)
+
+    def _open_event(self, event, day=None):
+        dialog = EventDialog(self, event, day=day)
+        while True:
+            response = dialog.run()
+            if response == EventDialog.DELETE_RESPONSE:
+                dialog.destroy()
+                self._delete(event)
+                return
+            if response != Gtk.ResponseType.OK:
+                dialog.destroy()
+                return
+            try:
+                draft = dialog.draft()
+            except EventError as exc:
+                dialog.show_error(str(exc))
+                continue
+            dialog.destroy()
+            self._run_write(
+                lambda: self.service.update(draft),
+                "Saved {0}".format(draft.summary),
+            )
+            return
+
+    # -- adding -----------------------------------------------------------
+    def _on_add(self, day):
+        """The agenda's Add button: a new event on the selected day."""
+        self._open_add(day)
+
+    def _on_add_at(self, day, time):
+        """A click on empty timeline space: an event starting at that time."""
+        self._open_add(day, at=time)
+
+    def _open_add(self, day, at=None):
+        dialog = AddEventDialog(self, day, at=at)
+        while True:
+            response = dialog.run()
+            if response != Gtk.ResponseType.OK:
+                dialog.destroy()
+                return
+            try:
+                draft = dialog.draft()
+            except EventError as exc:
+                dialog.show_error(str(exc))
+                continue
+            dialog.destroy()
+            self._run_write(lambda: self._create_allowing_overlap(draft),
+                            "Added {0}".format(draft.summary))
+            return
+
+    def _create_allowing_overlap(self, draft):
+        """Create without refusing a clash, but report who it overlaps.
+
+        Overlap is allowed -- two meetings in the same hour is a normal day --
+        so the clash list is passed back as part of the status message instead
+        of being raised as an error.
+        """
+        clashes = [item.summary for item in self.service.conflicts(draft)]
+        saved = self.service.create(draft, allow_conflict=True)
+        if clashes:
+            return "{0} (overlaps: {1})".format(saved.summary, ", ".join(clashes))
+        return saved.summary
+
+    # -- nudging times ----------------------------------------------------
+    def _on_adjust(self, event, day, kind):
+        """One of the agenda's nudge buttons: earlier, later, or longer."""
+        if kind == "earlier":
+            shifted = self.service.shift(event, dt.timedelta(minutes=-15))
+            message = "Moved {0} 15 minutes earlier".format(event.summary)
+        elif kind == "later":
+            shifted = self.service.shift(event, dt.timedelta(minutes=15))
+            message = "Moved {0} 15 minutes later".format(event.summary)
+        elif kind == "longer":
+            shifted = self.service.extend(event, dt.timedelta(minutes=30))
+            message = "Extended {0} by 30 minutes".format(event.summary)
+        else:
+            return
+        self._run_write(lambda: self.service.update(shifted), message)
+
+    # -- writing ----------------------------------------------------------
+    def _run_write(self, work, message):
+        """Run a calendar write off the GTK thread, then refresh the panels.
+
+        ``work`` returns either nothing or a better status line than
+        ``message`` (the create path appends who it overlaps).
+        """
+
+        def worker():
+            try:
+                result = work()
+            except Exception as exc:  # noqa: BLE001 - CalDAV errors are not EventError
+                GLib.idle_add(self._write_failed, str(exc))
+                return
+            GLib.idle_add(
+                self._write_done, result if isinstance(result, str) else message
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _write_done(self, message):
+        self.status_label.set_markup(
+            "<span foreground='#2ec27e'>{0}</span>".format(
+                GLib.markup_escape_text(str(message))
+            )
+        )
+        self.refresh()
+
+    def _write_failed(self, error):
+        self.status_label.set_markup(
+            "<span foreground='#c01c28'>Could not save: {0}</span>".format(
+                GLib.markup_escape_text(str(error))
+            )
+        )
+
+    def _delete(self, event):
+        """Ask before deleting, then delete off the GTK thread.
+
+        This path bypasses the assistant, so it has to carry its own
+        confirmation; a single misclick here would drop a real event.
+        """
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Delete every occurrence of this event?",
+        )
+        note = "{0}\n\nThis cannot be undone.".format(describe(event))
+        if event.rrule:
+            note = "{0}\n\nThis repeating event is deleted whole, so every past\nand future occurrence goes too.".format(
+                describe(event)
+            )
+        dialog.format_secondary_text(note)
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+
+        def worker():
+            try:
+                self.service.delete(event)
+            except Exception as exc:  # noqa: BLE001
+                GLib.idle_add(self._deleted, None, str(exc))
+                return
+            GLib.idle_add(self._deleted, event, "")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _deleted(self, event, error):
+        if error:
+            self.status_label.set_markup(
+                "<span foreground='#c01c28'>Delete failed: {0}</span>".format(error)
+            )
+        else:
+            self.status_label.set_markup(
+                "<span foreground='#2ec27e'>Deleted {0}</span>".format(event.summary)
+            )
         self.refresh()
 
     def _on_open_client(self, _btn):
         client = find_calendar_client()
         if not client:
-            self.log(install_client_hint())
+            self.chat.append(install_client_hint())
             return
-        self.log(f"Opening {client}...")
         subprocess.Popen([client])
 
 

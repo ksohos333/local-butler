@@ -14,7 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -252,6 +252,37 @@ class Event:
         ]
 
 
+def parse_until(raw: str, tz: Optional[dt.tzinfo] = None) -> Optional[dt.datetime]:
+    """Parse an RRULE ``UNTIL`` value into a naive local datetime bound.
+
+    RFC 5545 makes ``UNTIL`` inclusive, so a DATE-only value covers the whole
+    of that day. A value ending in ``Z`` is UTC and is converted into ``tz``
+    before comparison, since event start times are naive local wall clock.
+    Returns ``None`` when the value is absent or malformed.
+    """
+    text = (raw or "").strip().upper()
+    if not text:
+        return None
+    is_utc = text.endswith("Z")
+    if is_utc:
+        text = text[:-1]
+    if "T" in text:
+        fmt = "%Y%m%dT%H%M%S"
+    else:
+        fmt = "%Y%m%d"
+    try:
+        moment = dt.datetime.strptime(text, fmt)
+    except ValueError:
+        return None
+    if "T" not in text:
+        moment = moment.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if is_utc:
+        if tz is None:
+            return None
+        moment = moment.replace(tzinfo=dt.timezone.utc).astimezone(tz).replace(tzinfo=None)
+    return moment
+
+
 def validate_rrule(rrule: str) -> str:
     """Validate the supported subset of RRULE, returning it normalized."""
     text = (rrule or "").strip()
@@ -292,6 +323,10 @@ def validate_rrule(rrule: str) -> str:
         if count < 1:
             raise EventError("COUNT must be positive")
         parts["COUNT"] = str(count)
+    if "UNTIL" in parts:
+        if parse_until(parts["UNTIL"], dt.timezone.utc) is None:
+            raise EventError("UNTIL must be YYYYMMDD or YYYYMMDDTHHMMSS[Z]")
+        parts["UNTIL"] = parts["UNTIL"].strip().upper()
     return ";".join(
         "{0}={1}".format(key, parts[key]) for key in sorted(parts)
     )

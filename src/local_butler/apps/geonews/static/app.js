@@ -692,6 +692,237 @@ function appendAgentDelta(chunk) {
     log.scrollTop = log.scrollHeight;
 }
 
+// ─────────────────────────────────────────────────────────────
+// CHAT HISTORY
+//
+// The transcript is stored server-side, so it survives a reload and can be
+// reopened later. Three pieces of state drive it: the id of the chat currently
+// open (null = a fresh, not-yet-created one), the list of chats, and the
+// "loading" flag that stops a slow fetch from racing a new question.
+// ─────────────────────────────────────────────────────────────
+
+const AGENT_HISTORY_KEY = 'geonews.agent.session';
+let agentSessionId = null;
+let agentChats = [];
+let agentHistoryLoading = false;
+
+function agentLog() {
+    return document.getElementById('agent-log');
+}
+
+function agentIsBusy() {
+    const btn = document.getElementById('agent-send');
+    return btn && btn.disabled;
+}
+
+function clearAgentLog() {
+    const log = agentLog();
+    log.innerHTML = '';
+    agentLastMessage = null;
+    agentPendingSources = null;
+    clearAgentProgress();
+}
+
+// Set once the server has told us which chat a turn landed in. Kept in
+// localStorage so a reload reopens the conversation rather than orphaning it.
+function rememberSession(id) {
+    agentSessionId = id;
+    if (id) {
+        try { localStorage.setItem(AGENT_HISTORY_KEY, String(id)); }
+        catch { /* private mode: the in-memory id still works */ }
+    } else {
+        try { localStorage.removeItem(AGENT_HISTORY_KEY); } catch {}
+    }
+}
+
+function restoreSession() {
+    try {
+        const saved = localStorage.getItem(AGENT_HISTORY_KEY);
+        agentSessionId = saved ? parseInt(saved, 10) || null : null;
+    } catch {
+        agentSessionId = null;
+    }
+}
+
+function formatChatTime(iso) {
+    if (!iso) return '';
+    const when = new Date(iso.endsWith('Z') ? iso : iso + 'Z');
+    if (Number.isNaN(when.getTime())) return '';
+    const diff = Date.now() - when.getTime();
+    const mins = Math.round(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.round(hours / 24);
+    if (days < 7) return `${days}d ago`;
+    return when.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+}
+
+// The select doubles as the history list. Titles repeat and can be long, so the
+// date goes in the label and the first question in the tooltip.
+function renderChatHistory() {
+    const select = document.getElementById('agent-history');
+    if (!select) return;
+    select.innerHTML = '';
+
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = agentChats.length ? 'Recent conversations…' : 'No earlier chats yet';
+    select.appendChild(placeholder);
+
+    for (const chat of agentChats) {
+        const option = document.createElement('option');
+        option.value = String(chat.id);
+        const when = formatChatTime(chat.updated_at);
+        option.textContent = when ? `${chat.title} — ${when}` : chat.title;
+        option.title = chat.preview || chat.title;
+        select.appendChild(option);
+    }
+
+    if (agentSessionId && agentChats.some(c => c.id === agentSessionId)) {
+        select.value = String(agentSessionId);
+    } else {
+        select.value = '';
+    }
+
+    // Delete is only meaningful against a real conversation, so it appears once
+    // there is one to delete rather than as a permanently dead button.
+    const del = document.getElementById('agent-delete-chat');
+    if (del) del.hidden = !select.value;
+}
+
+async function loadChatList() {
+    try {
+        const res = await fetch('/api/agent/chats');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        agentChats = (await res.json()).chats || [];
+        renderChatHistory();
+    } catch (err) {
+        console.error('Could not load chat history:', err);
+        renderChatHistory();
+    }
+}
+
+async function openChat(chatId) {
+    const log = agentLog();
+    if (agentHistoryLoading || agentIsBusy()) return;
+
+    agentHistoryLoading = true;
+    try {
+        const res = await fetch(`/api/agent/chats/${chatId}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const chat = await res.json();
+
+        clearAgentLog();
+        if (!chat.messages || !chat.messages.length) {
+            appendGreetingNode('This conversation is empty. Ask something to start it.');
+        }
+        for (const message of chat.messages) {
+            appendAgentMessage(message.role, message.content || '');
+            // Re-show provenance so an old answer is still auditable. The metadata
+            // hangs off the turn, not the chat.
+            showAgentProvenance(message.meta);
+        }
+        rememberSession(chat.id);
+        renderChatHistory();
+        log.scrollTop = log.scrollHeight;
+    } catch (err) {
+        console.error('Could not open chat:', err);
+        appendAgentMessage('error', 'Could not open that conversation: ' + err.message);
+    } finally {
+        agentHistoryLoading = false;
+    }
+}
+
+function appendGreetingNode(text) {
+    const div = document.createElement('div');
+    div.className = 'agent-message assistant';
+    div.textContent = text;
+    agentLog().appendChild(div);
+    return div;
+}
+
+// Rebuild the "Consulted: …" line from a stored turn so a reopened answer still
+// shows what it was based on.
+function showAgentProvenance(meta) {
+    if (!meta) return;
+    if (meta.deep_research) {
+        showAgentSources(
+            `Deep research: ${meta.angles} angles, ${meta.articles_read} articles read`,
+            true
+        );
+    } else if (Array.isArray(meta.tools) && meta.tools.length) {
+        showAgentSources(`Consulted: ${[...new Set(meta.tools)].join(', ')}`, true);
+    }
+}
+
+async function startNewChat() {
+    if (agentIsBusy() || agentHistoryLoading) return;
+
+    const res = await fetch('/api/agent/chats', { method: 'POST' });
+    if (!res.ok) {
+        appendAgentMessage('error', 'Could not start a new chat.');
+        return;
+    }
+    const chat = (await res.json()).chat;
+
+    clearAgentLog();
+    appendGreetingNode('New conversation. What would you like to look into?');
+    rememberSession(chat.id);
+    await loadChatList();
+    document.getElementById('agent-input')?.focus();
+}
+
+async function deleteChat(chatId) {
+    const res = await fetch(`/api/agent/chats/${chatId}`, { method: 'DELETE' });
+    if (!res.ok) return false;
+    if (agentSessionId === chatId) {
+        clearAgentLog();
+        appendGreetingNode('Conversation deleted.');
+        rememberSession(null);
+    }
+    await loadChatList();
+    return true;
+}
+
+// Which tools the agent actually used for the pending answer. Shown above the
+// reply so a grounded answer is visibly different from one written from weights.
+let agentPendingSources = null;
+
+// Progress line for long runs (deep research). Reused in place so the log does
+// not fill with one line per research stage.
+let agentProgressNode = null;
+
+function showAgentProgress(text) {
+    const log = document.getElementById('agent-log');
+    if (!agentProgressNode || !agentProgressNode.isConnected) {
+        agentProgressNode = document.createElement('div');
+        agentProgressNode.className = 'agent-progress';
+        log.appendChild(agentProgressNode);
+    }
+    agentProgressNode.textContent = text + '…';
+    log.scrollTop = log.scrollHeight;
+}
+
+function clearAgentProgress() {
+    if (agentProgressNode && agentProgressNode.isConnected) agentProgressNode.remove();
+    agentProgressNode = null;
+}
+
+function showAgentSources(text, fresh = false) {
+    const log = document.getElementById('agent-log');
+    // Reusing one node keeps the live single-answer case tidy, but a transcript
+    // replay has several answers and each needs its own provenance line.
+    if (fresh || !agentPendingSources) {
+        agentPendingSources = document.createElement('div');
+        agentPendingSources.className = 'agent-sources';
+        log.appendChild(agentPendingSources);
+    }
+    agentPendingSources.textContent = text;
+    log.scrollTop = log.scrollHeight;
+}
+
 async function sendAgentMessage() {
     const input = document.getElementById('agent-input');
     const btn = document.getElementById('agent-send');
@@ -701,14 +932,25 @@ async function sendAgentMessage() {
     input.value = '';
     appendAgentMessage('user', text);
     agentLastMessage = null;
+    agentPendingSources = null;
+    clearAgentProgress();
     btn.disabled = true;
     input.disabled = true;
 
+    // Deep research is a separate endpoint because it takes a minute or more and
+    // streams stage progress; the chat path must stay fast.
+    const deep = document.getElementById('agent-deep')?.checked;
+    const endpoint = deep ? '/api/agent/research' : '/api/agent/chat';
+
     try {
-        const res = await fetch('/api/agent/chat', {
+        const res = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: text }),
+            // currentDetailArticleId is set by the detail panel, so the chat is grounded in
+// whatever article the user is actually reading.
+body: JSON.stringify(deep
+                ? { question: text, session_id: agentSessionId }
+                : { message: text, article_id: currentDetailArticleId, session_id: agentSessionId }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
 
@@ -729,17 +971,35 @@ async function sendAgentMessage() {
                 try {
                     const ev = JSON.parse(data);
                     if (ev.type === 'delta') appendAgentDelta(ev.content || '');
+                    else if (ev.type === 'sources') showAgentSources(ev.content || '');
+                    else if (ev.type === 'progress') showAgentProgress(ev.content || '');
+                    else if (ev.type === 'chat') {
+                        // The server decides which chat this is: it may have started a
+                        // new one because we had none, or ours may have been deleted.
+                        rememberSession(ev.session_id);
+                    }
+                    else if (ev.type === 'thinking') {
+                        // Create the bubble now so the wait is visible; the
+                        // first delta then appends into this same element.
+                        if (!agentLastMessage) agentLastMessage = appendAgentMessage('assistant', '');
+                    }
                     else if (ev.type === 'error') appendAgentMessage('error', ev.content || 'Agent error');
+                    else if (ev.type === 'done') clearAgentProgress();
                 } catch {}
             }
         }
     } catch (err) {
+        clearAgentProgress();
         console.error('Agent chat failed:', err);
         appendAgentMessage('error', 'Agent unavailable: ' + err.message);
     } finally {
+        clearAgentProgress();
         btn.disabled = false;
         input.disabled = false;
         input.focus();
+        // Refresh in the background: the title only exists once the first question
+        // has been stored, so waiting for this would leave the list stale.
+        loadChatList();
     }
 }
 
@@ -976,6 +1236,27 @@ function init() {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             sendAgentMessage();
+        }
+    });
+    document.getElementById('agent-new-chat')?.addEventListener('click', startNewChat);
+    document.getElementById('agent-history')?.addEventListener('change', (e) => {
+        const id = parseInt(e.target.value, 10);
+        if (id) openChat(id);
+        else renderChatHistory();
+    });
+    document.getElementById('agent-delete-chat')?.addEventListener('click', async () => {
+        if (!agentSessionId || !confirm('Delete this conversation for good?')) return;
+        await deleteChat(agentSessionId);
+    });
+
+    // Reopen whatever was in progress, then backfill the dropdown. Restoring the
+    // transcript has to happen after the list loads so the select can select.
+    restoreSession();
+    loadChatList().then(() => {
+        if (agentSessionId) {
+            openChat(agentSessionId).catch((err) => {
+                console.error('Could not restore previous chat:', err);
+            });
         }
     });
 

@@ -14,7 +14,9 @@ from local_butler.apps.calendar.events import Event, EventError, describe, parse
 from local_butler.apps.calendar.schedule import (
     ScheduleService,
     build_event,
+    extend_event,
     extract_json,
+    shift_event,
 )
 
 NOW = dt.datetime(2026, 9, 30, 23, 33)
@@ -395,3 +397,140 @@ def test_parse_asks_the_model_for_wording_only():
     prompt = llm.prompts[0]
     assert "coffee friday 10am" in prompt
     assert "time_of_day" in prompt
+
+
+# -- update / shift / extend ----------------------------------------------
+
+
+def test_update_writes_back_over_the_same_href():
+    service, _ = service_with(
+        json.dumps({"summary": "Coffee", "time_of_day": "10:00", "duration_minutes": 30})
+    )
+    event = service.from_text("coffee friday 10am", now=NOW)
+    href_before = event.href
+    assert href_before
+
+    event.start = event.start + dt.timedelta(minutes=15)
+    event.end = event.end + dt.timedelta(minutes=15)
+    event.description = "bring the beans"
+    service.update(event)
+
+    live = service.upcoming(days=30, now=NOW)
+    assert len(live) == 1  # replaced in place, not duplicated
+    assert live[0].href == href_before
+    assert live[0].description == "bring the beans"
+    assert live[0].start == event.start
+
+
+def test_update_without_an_href_is_refused():
+    service, _ = service_with("{}")
+    never_written = make_event()  # no href, so there is nothing to write over
+    with pytest.raises(CalDAVError):
+        service.update(never_written)
+
+
+def test_update_sends_the_etag_so_a_concurrent_edit_surfaces():
+    service = ScheduleService(client=StrictCalDAV(), llm=FakeLLM("{}"))
+    event = build_event(
+        {"summary": "Team review", "time_of_day": "15:00", "duration_minutes": 60},
+        now=NOW,
+        source_text="team review tuesday at 3pm",
+    )
+    service.create(event)
+    stored = service.upcoming(days=30, now=NOW)[0]
+
+    stored.etag = '"not-the-current-etag"'  # another client wrote in the meantime
+    stored.description = "changed here too"
+    with pytest.raises(CalDAVError):
+        service.update(stored)
+    assert service.upcoming(days=30, now=NOW)[0].description == ""
+
+
+def test_update_never_refuses_because_of_a_clash():
+    # Overlapping events are normal here: update must save a meeting that
+    # sits on top of another one without asking anybody.
+    reply = json.dumps({"summary": "Coffee", "time_of_day": "10:00", "duration_minutes": 30})
+    service, _ = service_with(reply)
+    event = service.from_text("coffee friday 10am", now=NOW)
+    service.create(
+        make_event(
+            summary="Team Sync",
+            start=event.start + dt.timedelta(minutes=15),
+            end=event.start + dt.timedelta(minutes=45),
+        ),
+        allow_conflict=True,
+    )
+
+    event.description = "moved onto the team sync on purpose"
+    service.update(event)  # no allow_conflict flag exists on purpose
+
+    live = service.upcoming(days=30, now=NOW)
+    assert len(live) == 2
+    assert {item.summary for item in live} == {"Coffee", "Team Sync"}
+
+
+def test_shift_moves_a_timed_event_and_leaves_the_original_alone():
+    event = make_event()
+
+    moved = shift_event(event, dt.timedelta(minutes=15))
+
+    assert moved.start == dt.datetime(2026, 10, 6, 15, 15)
+    assert moved.end == dt.datetime(2026, 10, 6, 16, 15)
+    assert (moved.end - moved.start) == (event.end - event.start)
+    assert event.start == dt.datetime(2026, 10, 6, 15, 0)  # untouched
+
+
+def test_shift_moves_an_all_day_event_in_whole_days():
+    holiday = make_event(
+        summary="Holiday",
+        start=dt.datetime(2026, 12, 24),
+        end=None,
+        all_day=True,
+    )
+
+    nudged = shift_event(holiday, dt.timedelta(minutes=15))
+    assert nudged.start == holiday.start  # a nudge must not change the day
+
+    tomorrow = shift_event(holiday, dt.timedelta(days=1, minutes=15))
+    assert tomorrow.start == dt.datetime(2026, 12, 25)
+    assert (tomorrow.end - tomorrow.start) == dt.timedelta(days=1)
+
+    back = shift_event(holiday, dt.timedelta(days=-1))
+    assert back.start == dt.datetime(2026, 12, 23)
+
+
+def test_extend_lengthens_an_event_and_can_shorten_it():
+    event = make_event()
+
+    longer = extend_event(event, dt.timedelta(minutes=30))
+    assert longer.end == dt.datetime(2026, 10, 6, 16, 30)
+    assert longer.start == event.start
+
+    shorter = extend_event(event, dt.timedelta(minutes=-30))
+    assert (shorter.end - shorter.start) == dt.timedelta(minutes=30)
+    assert event.end == dt.datetime(2026, 10, 6, 16, 0)  # original untouched
+
+
+def test_extend_refuses_to_shrink_an_event_to_nothing():
+    event = make_event()
+    with pytest.raises(EventError):
+        extend_event(event, dt.timedelta(minutes=-60))  # ends exactly at start
+    with pytest.raises(EventError):
+        extend_event(event, dt.timedelta(hours=-2))
+
+
+def test_shift_then_extend_then_update_saves_the_result():
+    service, _ = service_with(
+        json.dumps({"summary": "Coffee", "time_of_day": "10:00", "duration_minutes": 30})
+    )
+    event = service.from_text("coffee friday 10am", now=NOW)
+
+    moved = service.shift(event, dt.timedelta(minutes=15))
+    assert moved.href == event.href  # still addressable after the copy
+    extended = service.extend(moved, dt.timedelta(minutes=30))
+    service.update(extended)
+
+    live = service.upcoming(days=30, now=NOW)
+    assert len(live) == 1
+    assert live[0].start == event.start + dt.timedelta(minutes=15)
+    assert (live[0].end - live[0].start) == dt.timedelta(minutes=60)

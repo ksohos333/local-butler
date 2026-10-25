@@ -22,7 +22,15 @@ secrets.json
 *.sqlite
 *.sqlite3
 
+# Bulk third-party event payloads (multi-MB, re-obtainable from the source)
+data/acled/
+
 # Runtime output
 logs/
 tmp/
 *.log
+
+# Python bytecode — these were tracked before this rule existed
+__pycache__/
+*.py[cod]
+*$py.class

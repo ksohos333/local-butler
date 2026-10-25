@@ -172,8 +172,8 @@ class Market(Base):
     bets: Mapped[list["Bet"]] = relationship(
         "Bet", back_populates="market", lazy="selectin"
     )
-    transactions: Mapped[list["Transaction"]] = relationship(
-        "Transaction", back_populates="market"
+    transactions: Mapped[list["MarketTransaction"]] = relationship(
+        "MarketTransaction", back_populates="market"
     )
     external_predictions: Mapped[list["ExternalPrediction"]] = relationship(
         "ExternalPrediction", back_populates="market"
@@ -202,7 +202,7 @@ class Bet(Base):
     market: Mapped["Market"] = relationship("Market", back_populates="bets")
 
 
-class Transaction(Base):
+class MarketTransaction(Base):
     """Ledger entry for simulated credits."""
 
     __tablename__ = "geonews_transactions"

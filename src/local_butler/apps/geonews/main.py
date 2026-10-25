@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,11 +16,22 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, text as sa_text
 from sqlalchemy.orm import Session
 
 from local_butler.apps.geonews import models
 from local_butler.apps.geonews.ingestion.config import enabled_sources
+from local_butler.apps.geonews.agent import GeonewsAgent
+from local_butler.apps.geonews.deep_research import DeepResearcher
+from local_butler.apps.geonews.llm import (
+    AGENT_TOOLS,
+    DEFAULT_LLM_URL,
+    DEFAULT_OLLAMA_URL,
+    LLMUnavailable,
+    LocalLLM,
+    build_news_context,
+)
+from local_butler.apps.geonews.memory import get_store
 from local_butler.apps.geonews.ingestion.runner import (
     background_ingest_loop,
     ingest_all,
@@ -42,15 +54,30 @@ from local_butler.apps.geonews.schemas import (
     TrendsResponse,
 )
 from local_butler.core.database import engine, get_db
+from local_butler.core.database import SessionLocal
 
 
 class AgentChatRequest(BaseModel):
     message: str
-    session_id: str | None = None
+    # Which chat this turn belongs to. Omitted or stale means "start a new one",
+    # so the client never has to care whether the id is still valid.
+    session_id: int | None = None
+    # Optional article context so the answer can be grounded in what the user
+    # is currently reading instead of the model guessing from memory.
+    article_id: int | None = None
 
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def LLM() -> LocalLLM:
+    """Build a client from GEONEWS_LLM_URL / GEONEWS_LLM_MODEL when set."""
+    return LocalLLM(
+        base_url=os.environ.get("GEONEWS_LLM_URL", DEFAULT_LLM_URL),
+        ollama_url=os.environ.get("GEONEWS_OLLAMA_URL", DEFAULT_OLLAMA_URL),
+        model=os.environ.get("GEONEWS_LLM_MODEL", ""),
+    )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
@@ -266,33 +293,38 @@ async def summarize_article(article_id: int, db: Session = Depends(get_db)):
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
 
-    text = article.body or article.summary or article.title
+    context = build_news_context(
+        title=article.title,
+        body=article.body or "",
+        summary=article.summary or "",
+        sources=[{"name": article.source_name, "url": article.url or ""}]
+        if article.source_name
+        else None,
+    )
+
     prompt = (
         "Summarize the following news article in at most three paragraphs. "
         "Paragraph 1: what happened. Paragraph 2: where and who is involved. "
         "Paragraph 3: why it matters globally. Keep the tone neutral, factual, and concise.\n\n"
-        f"Title: {article.title}\n\n{text[:8000]}"
+        + context
     )
 
+    # Blocking urllib call inside a thread: llama-server takes many seconds to
+    # answer and would otherwise stall the event loop.
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.post(
-                "http://127.0.0.1:11434/api/generate",
-                json={"model": "llama3.2:3b", "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return {"summary": data.get("response", "").strip()}
-    except httpx.ConnectError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Ollama is not running. Install and start it, then try again.",
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ollama request failed: {exc}",
-        ) from exc
+        summary = await asyncio.to_thread(
+            LLM().complete,
+            [
+                {"role": "system", "content": "You are a precise news summarizer."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=900,
+            temperature=0.3,
+        )
+    except LLMUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return {"summary": summary}
 
 
 @app.get("/api/trends", response_model=TrendsResponse)
@@ -421,27 +453,345 @@ async def get_trends(
     )
 
 
+@app.get("/api/agent/notes")
+async def agent_notes(limit: int = 100):
+    """What the agent currently remembers, so the user can inspect and correct it.
+
+    A memory the user cannot see or delete is a memory they cannot trust.
+    """
+    return {"notes": get_store().list_notes(limit=limit)}
+
+
+@app.delete("/api/agent/notes/{note_id}")
+async def agent_delete_note(note_id: int):
+    deleted = get_store().delete_note(note_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="No such note")
+    return {"deleted": note_id}
+
+
+@app.get("/api/agent/health")
+async def agent_health():
+    """Report which local model backend the agent uses, and what it can reach."""
+    llm = LLM()
+    model = llm.first_model() if llm.llama_available() else ""
+    store = get_store()
+    return {
+        "backend": llm.backend(),
+        "model": model,
+        "tools": [t["function"]["name"] for t in AGENT_TOOLS],
+        "memory": {
+            "notes": len(store.list_notes(limit=1000)),
+            "events": len(store.recent_events(hours=24 * 365, limit=1000)),
+        },
+        "capabilities": {
+            "corpus_articles": _article_count(),
+            "live_news_sources": _feed_count(),
+            "wikipedia": True,
+            "web_search": "best-effort (DuckDuckGo rate-limits this host)",
+        },
+        "ollama_models": llm.ollama_models() if not model else [],
+    }
+
+
+def _article_count() -> int:
+    try:
+        with engine.connect() as conn:
+            return conn.execute(sa_text("SELECT COUNT(*) FROM geonews_articles")).scalar() or 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _feed_count() -> int:
+    try:
+        return len(enabled_sources())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+@app.get("/api/agent/chats")
+async def agent_chats(limit: int = 50):
+    """Past conversations, newest first.
+
+    Chat history used to live only in the DOM: a reload lost it, and there was no
+    way to go back to a question asked yesterday.
+    """
+    return {"chats": get_store().list_chats(limit=limit)}
+
+
+@app.post("/api/agent/chats")
+async def agent_new_chat():
+    """Open an empty chat. This is what the New chat button calls."""
+    return {"chat": get_store().create_chat()}
+
+
+@app.get("/api/agent/chats/{chat_id}")
+async def agent_chat_history(chat_id: int):
+    """One chat with its full transcript, oldest turn first."""
+    chat = get_store().get_chat(chat_id)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="No such chat")
+    return chat
+
+
+class AgentChatRename(BaseModel):
+    title: str
+
+
+@app.patch("/api/agent/chats/{chat_id}")
+async def agent_rename_chat(chat_id: int, req: AgentChatRename):
+    """Retitle a chat. Auto-titles come from the first question, which is often
+    a long one the user would rather name differently."""
+    if not get_store().rename_chat(chat_id, req.title):
+        raise HTTPException(status_code=404, detail="No such chat")
+    return {"chat": get_store().get_chat(chat_id)}
+
+
+@app.delete("/api/agent/chats/{chat_id}")
+async def agent_delete_chat(chat_id: int):
+    """Remove a chat and every turn in it."""
+    if not get_store().delete_chat(chat_id):
+        raise HTTPException(status_code=404, detail="No such chat")
+    return {"deleted": chat_id}
+
+
+def _resolve_chat(chat_id: int | None) -> tuple[int, list[dict]]:
+    """Find or start the chat this request belongs to, and load its history.
+
+    Returns (chat_id, history). Falls back to opening a fresh chat whenever the id
+    is missing or stale, so a deleted chat in another tab degrades to a new
+    conversation instead of a 404 in the middle of a question.
+    """
+    store = get_store()
+    if chat_id is not None:
+        try:
+            history = store.chat_history(chat_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load chat %s: %s", chat_id, exc)
+            history = []
+        if history or store.get_chat(chat_id):
+            return chat_id, history
+        chat_id = None
+    return store.create_chat()["id"], []
+
+
 @app.post("/api/agent/chat")
-async def agent_chat(req: AgentChatRequest):
-    """Proxy a chat message to the local bigus_dickus agent (local-brain)."""
+async def agent_chat(req: AgentChatRequest, db: Session = Depends(get_db)):
+    """Answer a question using tools: own corpus, live wires, web, memory.
+
+    This used to proxy through local-brain to TrueForge, which spawns its own
+    llama-server and could not fit alongside the resident one (CUDA OOM). It then
+    answered current-events questions from weights alone, producing "I don't have
+    access to real-time news". Now it calls the resident model with tools and
+    requires a search for anything recent.
+
+    Every turn is persisted to the chat the ``session_id`` names, so the history
+    survives a reload and a resumed chat can refer back to earlier questions.
+    """
 
     async def _stream():
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                async with client.stream(
-                    "POST",
-                    "http://127.0.0.1:9876/api/chat",
-                    json={"message": req.message, "session_id": req.session_id},
-                    headers={"Content-Type": "application/json"},
-                ) as resp:
-                    async for chunk in resp.aiter_raw():
-                        yield chunk
-        except Exception as exc:
-            logger.warning("Agent chat proxy error: %s", exc)
-            payload = json.dumps({"type": "error", "content": f"Agent proxy error: {exc}"})
-            yield f"data: {payload}\n\n".encode("utf-8")
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        DONE = object()
+
+        def produce() -> None:
+            def emit(kind: str, payload) -> None:
+                # The producer runs on a worker thread; the queue belongs to the
+                # event loop, so every put is hopped across.
+                loop.call_soon_threadsafe(queue.put_nowait, (kind, payload))
+
+            try:
+                chat_id, history = _resolve_chat(req.session_id)
+                emit("chat", {"session_id": chat_id})
+                store = get_store()
+                store.add_message(chat_id, "user", req.message)
+                # Fresh SQLAlchemy session: the request-scoped one belongs to the
+                # event loop thread and this runs on a worker thread.
+                session = SessionLocal()
+                try:
+                    agent = GeonewsAgent(
+                        session,
+                        progress=lambda message: emit("progress", message),
+                        history=history,
+                    )
+                    answer, meta = agent.run(req.message, req.article_id)
+                    store.add_message(
+                        chat_id, "assistant", answer, meta=_turn_meta(meta)
+                    )
+                    emit("result", (answer, meta))
+                finally:
+                    session.close()
+            except LLMUnavailable as exc:
+                emit("error", str(exc))
+            except Exception as exc:  # noqa: BLE001 - surface, never crash the stream
+                logger.exception("Agent chat failed")
+                emit("error", str(exc))
+            finally:
+                emit("done", None)
+
+        task = loop.run_in_executor(None, produce)
+
+        yield _sse({"type": "thinking"})
+
+        result = None
+        error = None
+        chat_event = None
+        while True:
+            kind, payload = await queue.get()
+            if kind == "progress":
+                yield _sse({"type": "progress", "content": payload})
+            elif kind == "chat":
+                chat_event = payload
+            elif kind == "result":
+                result = payload
+            elif kind == "error":
+                error = payload
+            elif kind == "done":
+                break
+
+        await task
+
+        # Sent even on error: the user's question was persisted, so the id has to
+        # reach the browser for the turn to be findable afterwards.
+        if chat_event:
+            yield _sse({"type": "chat", **chat_event})
+
+        if error:
+            yield _sse({"type": "error", "content": error})
+            yield _sse({"type": "done"})
+            return
+
+        answer, meta = result
+        if meta.get("tools"):
+            # Tell the user what was actually consulted; silent browsing makes a
+            # grounded answer indistinguishable from a guess.
+            names = ", ".join(sorted(set(meta["tools"])))
+            yield _sse({"type": "sources", "content": f"Consulted: {names}"})
+        for start in range(0, len(answer), 90):
+            yield _sse({"type": "delta", "content": answer[start : start + 90]})
+        yield _sse({"type": "done"})
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+def _turn_meta(meta: dict) -> dict:
+    """The parts of a turn's metadata worth keeping in the transcript.
+
+    The full meta carries search strings and research angles that are noise in a
+    history view; the tool names are what later let you see why an old answer was
+    trustworthy.
+    """
+    return {
+        "tools": list(meta.get("tools", [])),
+        "notes": list(meta.get("notes", [])),
+        "forced_search": bool(meta.get("forced_search")),
+    }
+
+
+class AgentResearchRequest(BaseModel):
+    question: str
+    # Reports are long enough that losing them on reload would waste the pass, so
+    # they land in a chat like any other turn.
+    session_id: int | None = None
+
+
+@app.post("/api/agent/research")
+async def agent_research(req: AgentResearchRequest):
+    """Run a full deep-research pass and stream progress while it works.
+
+    Separate from ``/api/agent/chat`` because this takes a minute or more: the
+    research stages are pushed over SSE as they complete, so the user watches the
+    plan and gather steps instead of staring at a spinner. Progress crosses a
+    thread boundary, so it goes through the loop's queue like the final result.
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    DONE = object()
+
+    async def _stream():
+        def produce() -> None:
+            def emit(kind: str, payload) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, (kind, payload))
+
+            try:
+                chat_id, _ = _resolve_chat(req.session_id)
+                emit("chat", {"session_id": chat_id})
+                store = get_store()
+                store.add_message(chat_id, "user", req.question)
+                session = SessionLocal()
+                try:
+                    researcher = DeepResearcher(
+                        session, progress=lambda message: emit("progress", message)
+                    )
+                    result, meta = researcher.research(req.question)
+                    store.add_message(
+                        chat_id,
+                        "assistant",
+                        result,
+                        meta={
+                            "deep_research": True,
+                            "angles": len(meta.get("angles", [])),
+                            "articles_read": meta.get("articles_read", 0),
+                            "sources": meta.get("sources", [])[:12],
+                        },
+                    )
+                    emit("result", (result, meta))
+                finally:
+                    session.close()
+            except LLMUnavailable as exc:
+                emit("error", str(exc))
+            except Exception as exc:  # noqa: BLE001 - surface, never crash
+                logger.exception("Deep research failed")
+                emit("error", str(exc))
+            finally:
+                emit("done", None)
+
+        task = loop.run_in_executor(None, produce)
+        yield _sse({"type": "thinking", "content": "Researching"})
+
+        result = None
+        error = None
+        chat_event = None
+        while True:
+            kind, payload = await queue.get()
+            if kind == "progress":
+                yield _sse({"type": "progress", "content": payload})
+            elif kind == "chat":
+                chat_event = payload
+            elif kind == "result":
+                result = payload
+            elif kind == "error":
+                error = payload
+            elif kind == "done":
+                break
+
+        await task
+
+        if chat_event:
+            yield _sse({"type": "chat", **chat_event})
+
+        if error:
+            yield _sse({"type": "error", "content": error})
+            yield _sse({"type": "done"})
+            return
+
+        report_text, meta = result
+        yield _sse({
+            "type": "sources",
+            "content": (
+                f"Deep research: {len(meta.get('angles', []))} angles, "
+                f"{meta.get('articles_read', 0)} articles read"
+            ),
+        })
+        for start in range(0, len(report_text), 90):
+            yield _sse({"type": "delta", "content": report_text[start : start + 90]})
+        yield _sse({"type": "done"})
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+def _sse(payload: dict) -> bytes:
+    return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
 
 
 @app.get("/api/stats", response_model=StatsResponse)

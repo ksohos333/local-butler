@@ -22,6 +22,7 @@ import json
 import re
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence
 
 from local_butler.apps.calendar.caldav import CalDAVClient, CalDAVError
@@ -113,26 +114,33 @@ class LocalLLM:
             pass
         return "local-model"
 
-    def chat(self, system: str, user: str) -> str:
-        """Run one completion with Qwen3 thinking disabled."""
+    def _complete(
+        self,
+        messages: Sequence[Dict[str, Any]],
+        max_tokens: int = 1024,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        temperature: float = 0.2,
+        enable_thinking: bool = False,
+    ) -> Dict[str, Any]:
+        """One POST to the chat completions endpoint, returning the raw body."""
         model = self.first_model()
         if not model:
             raise LLMUnavailable("no model served by {0}".format(self.base_url))
-        payload = json.dumps(
-            {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    # /no_think keeps the reasoning model from spending the whole
-                    # token budget on hidden thinking, which otherwise returns
-                    # empty content.
-                    {"role": "user", "content": "/no_think\n" + user},
-                ],
-                "temperature": 0.2,
-                "max_tokens": 1024,
-                "stream": False,
-            }
-        ).encode("utf-8")
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": list(messages),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        if not enable_thinking:
+            # Qwen3 reasons before answering, which can spend the whole token
+            # budget on prose and leave no JSON for extract_json to find.
+            body["chat_template_kwargs"] = {"enable_thinking": False}
+        if tools:
+            body["tools"] = list(tools)
+            body["tool_choice"] = "auto"
+        payload = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             self.base_url + "/v1/chat/completions",
             data=payload,
@@ -141,24 +149,59 @@ class LocalLLM:
         request.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:200]
             raise LLMUnavailable("llama-server returned {0}: {1}".format(exc.code, detail)) from exc
         except urllib.error.URLError as exc:
             raise LLMUnavailable("cannot reach {0}: {1}".format(self.base_url, exc.reason)) from exc
+
+    def _first_message(self, data: Dict[str, Any]) -> Dict[str, Any]:
         choices = data.get("choices") or []
         if not choices:
             raise LLMUnavailable("llama-server returned no choices")
-        message = choices[0].get("message") or {}
+        return choices[0].get("message") or {}
+
+    @staticmethod
+    def _message_text(message: Dict[str, Any]) -> str:
         text = (message.get("content") or "").strip()
         if not text and message.get("reasoning_content"):
-            # Thinking-only reply: keep the tail of the reasoning so the caller
-            # can still try to parse it instead of returning nothing.
+            # Thinking-only reply: keep the reasoning so the caller can still try
+            # to parse it instead of returning nothing.
             text = str(message["reasoning_content"]).strip()
+        return text
+
+    def chat(self, system: str, user: str) -> str:
+        """Run one completion with Qwen3 thinking disabled."""
+        message = self._first_message(
+            self._complete(
+                [
+                    {"role": "system", "content": system},
+                    # /no_think keeps the reasoning model from spending the whole
+                    # token budget on hidden thinking, which otherwise returns
+                    # empty content.
+                    {"role": "user", "content": "/no_think\n" + user},
+                ]
+            )
+        )
+        text = self._message_text(message)
         if not text:
             raise LLMUnavailable("model returned empty content")
         return text
+
+    def chat_tools(
+        self,
+        messages: Sequence[Dict[str, Any]],
+        tools: Sequence[Dict[str, Any]],
+        max_tokens: int = 1024,
+    ) -> Dict[str, Any]:
+        """One tool-enabled turn; returns the assistant message as-is.
+
+        Split out from :meth:`chat` because a tool turn legitimately has empty
+        ``content`` and carries its answer in ``tool_calls``, so the text
+        extraction that :meth:`chat` does would discard it.
+        """
+        return self._first_message(self._complete(messages, max_tokens, tools))
 
 
 def extract_json(text: str) -> Dict[str, Any]:
@@ -418,6 +461,34 @@ class ScheduleService:
                     return record["etag"]
         return None
 
+    def update(self, event: Event) -> Event:
+        """Write an edited event back over its own href.
+
+        Nothing here refuses to save: overlapping events are a normal, wanted
+        state of this calendar, so the caller decides what to do about a clash.
+        The ETag is sent when we have one, so a change made in another client
+        still surfaces instead of being clobbered.
+        """
+        if not event.href:
+            raise CalDAVError("event has no href; cannot update")
+        href = self.client.put_event(
+            event.to_ics(),
+            uid=event.uid,
+            href=event.href,
+            if_match=event.etag,
+        )
+        event.href = href
+        event.etag = self._etag_for(event.uid)
+        return event
+
+    def shift(self, event: Event, delta: dt.timedelta) -> Event:
+        """A copy of ``event`` moved by ``delta``, all-day moves in whole days."""
+        return shift_event(event, delta)
+
+    def extend(self, event: Event, delta: dt.timedelta) -> Event:
+        """A copy of ``event`` whose end is pushed later by ``delta``."""
+        return extend_event(event, delta)
+
     def delete(self, event: Event) -> None:
         if not event.href:
             raise CalDAVError("event has no href; cannot delete")
@@ -460,6 +531,27 @@ class ScheduleService:
     ) -> Event:
         """Parse a scheduling note with the local model and create the event."""
         return self.create(self.parse(text, now=now), allow_conflict=allow_conflict)
+
+
+def shift_event(event: Event, delta: dt.timedelta) -> Event:
+    """A copy of ``event`` moved by ``delta``.
+
+    All-day events are dates rather than instants, so they move in whole days:
+    a fifteen-minute nudge on a birthday would otherwise silently turn it into
+    a timed event the next day. The delta is rounded to the nearest day.
+    """
+    if event.all_day:
+        days = int(round(delta.total_seconds() / 86400.0))
+        delta = dt.timedelta(days=days)
+    return replace(event, start=event.start + delta, end=event.end + delta)
+
+
+def extend_event(event: Event, delta: dt.timedelta) -> Event:
+    """A copy of ``event`` whose end is pushed later by ``delta``."""
+    new_end = event.end + delta
+    if new_end <= event.start:
+        raise EventError("an event cannot be shorter than zero")
+    return replace(event, end=new_end)
 
 
 def format_schedule(events: Sequence[Event]) -> str:

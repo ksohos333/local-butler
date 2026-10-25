@@ -4,7 +4,13 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from local_butler.apps.geonews.models import Bet, Market, Transaction, User, Wallet
+from local_butler.apps.geonews.models import (
+    Bet,
+    Market,
+    MarketTransaction,
+    User,
+    Wallet,
+)
 
 
 DEFAULT_STARTING_BALANCE = 10_000
@@ -48,7 +54,7 @@ def credit_wallet(db: Session, user_id: int, amount: int, tx_type: str,
     wallet.updated_at = datetime.now(timezone.utc)
     db.add(wallet)
 
-    tx = Transaction(
+    tx = MarketTransaction(
         user_id=user_id,
         amount=amount,
         type=tx_type,
@@ -70,7 +76,7 @@ def debit_wallet(db: Session, user_id: int, amount: int, tx_type: str,
     wallet.updated_at = datetime.now(timezone.utc)
     db.add(wallet)
 
-    tx = Transaction(
+    tx = MarketTransaction(
         user_id=user_id,
         amount=-amount,
         type=tx_type,
