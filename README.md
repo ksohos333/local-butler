@@ -1,112 +1,134 @@
 # Local Butler
 
-A local-first monorepo for personal automation:
+A local-first platform of eight small Python applications that run entirely on
+your own machine — a news intelligence engine with a live map and prediction
+markets, a natural-language calendar, a money tracker, a Linux troubleshooter, a
+camera/microphone monitor, and more. One host process, no accounts, no cloud,
+no telemetry.
 
-- **Geonews** — primary-source news aggregator with live map and prediction markets.
-- **Money Tracker** — simple income/expense web app.
-- **LLM Brain** — (scaffold) extend local-brain / TrueForge agent memory.
-- **Voice MCP** — (scaffold) push-to-record Whisper transcription for OpenCode.
+| | |
+|---|---|
+| Applications | 8 packages (6 complete, 2 scaffolds) |
+| Tests | 393 passing, 2 skipped |
+| Code | ~19,000 lines application, ~6,500 lines tests |
+| Stack | Python 3.12, FastAPI, SQLAlchemy, Alembic, SQLite, Jinja2, Leaflet |
 
-## Setup
+## The applications
+
+### GeoNews — news intelligence *(flagship)*
+
+Ingests 25 primary-source feeds, geolocates every story, and renders the result
+on an interactive Leaflet map with marker clustering. On top of that:
+
+- **Bayesian trend scoring** over article volume, so emerging stories surface
+  ahead of the mainstream.
+- **An LLM research agent** (`agent.py`, `deep_research.py`) that answers
+  open-ended questions across the ingested corpus.
+- **Prediction markets** — wallets, bets and a credit ledger, with external
+  predictions folded in (`market/`).
+- **Telegram and web ingestion**, web search, geocoding, an analytics package,
+  and a GTK desktop client alongside the web app.
+
+### Calendar — natural-language scheduling
+
+Controls a local Radicale CalDAV server and turns plain-language requests into
+calendar events. Handles recurrence rules, a day timeline, conflict resolution,
+and slot optimisation, and can talk to MCP servers.
+
+### Money Tracker
+
+Categories, transactions and summaries over a local SQLite database.
+
+### Diagnostic — Linux troubleshooter
+
+A GTK system troubleshooter: gathers system information and runs the checks that
+usually need root, so you can diagnose a problem before you escalate it.
+
+### Privacy Dashboard
+
+Camera and microphone monitor — see exactly what is holding the device open.
+
+### Cloud
+
+A multi-backend local cloud hub.
+
+### LLM Brain · Voice MCP
+
+Scaffolds for a local LLM backend and a push-to-record Whisper pipeline.
+
+## Quick start
 
 ```bash
-cd ~/local-butler
-uv sync
-```
+git clone https://github.com/ksohos333/local-butler.git
+cd local-butler
 
-## Run Geonews
+uv sync          # or: python3 -m venv .venv && pip install -e '.[dev]'
 
-From inside the repo:
-
-```bash
-cd ~/local-butler
 uv run local-butler geonews
 ```
 
-Or use the global launcher added to your machine:
+Then open <http://127.0.0.1:8788/>. Other apps are started the same way —
+`uv run local-butler money`, `uv run local-butler calendar`, and so on.
+
+Run the desktop clients directly for the GTK apps:
 
 ```bash
-geonews
+uv run python -m local_butler.apps.geonews.main_gtk
 ```
 
-Then open http://127.0.0.1:8788/
+## Architecture
 
-### Desktop app icon
-
-A `.desktop` entry was created at `~/.local/share/applications/geonews.desktop`
-and an icon at `~/.local/share/icons/geonews.svg`. You should now be able to:
-
-- Type **“Geonews”** in the apps menu search.
-- Click the map-pin icon to launch Geonews.
-
-If it doesn't appear immediately, refresh the desktop database:
-
-```bash
-update-desktop-database ~/.local/share/applications
+```text
+src/local_butler/
+├── core/
+│   ├── database.py      # Shared engine, session and declarative Base
+│   └── schemas.py       # Shared Pydantic schemas
+├── apps/
+│   ├── geonews/         # News intelligence, map, agent, markets
+│   ├── calendar/        # CalDAV + natural-language scheduling
+│   ├── money_tracker/   # Categories and transactions
+│   ├── diagnostic/      # GTK Linux troubleshooter
+│   ├── privacy_dashboard/
+│   ├── cloud/
+│   ├── llm_brain/       # scaffold
+│   └── voice_mcp/       # scaffold
+└── alembic/versions/    # Schema migrations
 ```
 
-## Run Money Tracker
+Every app has its own `models.py` with explicit `__tablename__`s, so several
+applications can share one database without colliding in the SQLAlchemy
+registry.
 
-```bash
-local-butler money
-# or
-uv run python -m local_butler money
-```
-
-Then open http://127.0.0.1:8787/
-
-## Run tests
+## Testing
 
 ```bash
 uv run pytest
 ```
 
-## Geonews Phase 4 roadmap (saved for later)
+393 tests cover the API layer, the data model, the scheduling logic and the
+ingestion pipelines:
 
-- LLM summarization, Fake News Index, bias tagging, entity extraction.
-- Replace the hardcoded geo gazetteer with a local NER/geocoding model.
-- Social-media viewers and scrapers that do not require a personal login:
-  Twitter/X, VK, Weibo, Telegram public channels, and other hard-to-reach
-  regions where direct internet access is unreliable.
-
-## Database migrations
-
-Geonews uses Alembic for schema migrations. After pulling updates, run:
-
-```bash
-cd ~/local-butler
-uv run alembic upgrade head
+```text
+tests/
+├── calendar/       # recurrence, timeline, panels, optimisation, assistant
+├── diagnostic/
+├── geonews/        # market and chat endpoints
+├── money_tracker/  # CRUD and summaries
+└── geonews_smoke_test.py
 ```
 
-The desktop launcher (`~/.local/bin/geonews`) runs this automatically before starting the server.
+## Data
 
-## Project structure
+Everything lives under `~/.local/share/local-butler/`. Nothing is sent
+anywhere. GeoNews pulls from the feeds listed in
+`src/local_butler/apps/geonews/sources.toml`.
 
-```
-local-butler/
-├── pyproject.toml
-├── src/local_butler/
-│   ├── __init__.py
-│   ├── core/
-│   │   ├── database.py
-│   │   └── schemas.py
-│   └── apps/
-│       ├── geonews/
-│       │   ├── main.py
-│       │   ├── models.py
-│       │   ├── schemas.py
-│       │   ├── ingestion/
-│       │   ├── processing/
-│       │   ├── geo/
-│       │   ├── market/
-│       │   ├── templates/
-│       │   └── static/
-│       ├── money_tracker/
-│       │   ├── main.py
-│       │   ├── crud.py
-│       │   ├── models.py
-│       │   └── templates/index.html
-│       ├── llm_brain/
-│       └── voice_mcp/
-└── tests/
-```
+## Design notes
+
+`docs/` holds the reasoning behind the structure, including
+[ADR-001-layout.md](docs/ADR-001-layout.md), the calendar and cloud design
+notes, and a diagnostic code review.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
